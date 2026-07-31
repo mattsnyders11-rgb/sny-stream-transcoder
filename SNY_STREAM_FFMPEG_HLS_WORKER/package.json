@@ -1,14 +1,12 @@
 {
-  "name": "sny-stream-transcoder",
+  "name": "sny-stream-transcoder-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "Dedicated Node.js + FFmpeg HLS compatibility worker for SNY Stream.",
   "type": "module",
-  "main": "server/server.js",
+  "description": "SNY Stream Universal Playback Engine v1 — direct remux/transcode worker.",
   "scripts": {
-    "start": "node server/server.js",
-    "check": "node --check server/server.js && node --check server/job-manager.js && node --check server/security.js",
-    "test": "node --test tests/*.test.mjs"
+    "start": "node server.js",
+    "check": "node --check server.js"
   },
   "engines": {
     "node": ">=20 <23"
