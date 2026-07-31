@@ -147,7 +147,11 @@ const server = http.createServer((req, res) => {
   Promise.resolve(handleRequest(req, res)).catch(error => {
     console.error('Transcoder request failed:', error);
     if (!res.headersSent) {
-      sendJson(res, Number(error.statusCode) || 500, { error: error.message || 'Transcoder error.' });
+      sendJson(res, Number(error.statusCode) || 500, {
+        error: error.message || 'Transcoder error.',
+        code: error.code || 'TRANSCODER_ERROR',
+        retryable: error.retryable !== false
+      });
     } else if (!res.writableEnded) {
       res.end();
     }

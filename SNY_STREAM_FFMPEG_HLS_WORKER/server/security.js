@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 
+const REAL_DEBRID_HOST = 'real-debrid.com';
+
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
   if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return true;
@@ -63,6 +65,15 @@ export async function validateSourceUrl(value) {
   }
   if (!parsed.hostname || (!allowPrivateSources && parsed.hostname.toLowerCase() === 'localhost')) {
     throw new Error('Localhost media sources are not accepted.');
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === REAL_DEBRID_HOST || hostname.endsWith(`.${REAL_DEBRID_HOST}`)) {
+    const error = new Error('Real-Debrid sources must use provider-native playback.');
+    error.statusCode = 400;
+    error.code = 'PROVIDER_NATIVE_PLAYBACK_REQUIRED';
+    error.retryable = false;
+    throw error;
   }
 
   const literalFamily = net.isIP(parsed.hostname);

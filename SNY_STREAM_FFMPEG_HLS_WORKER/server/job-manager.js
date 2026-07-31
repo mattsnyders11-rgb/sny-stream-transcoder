@@ -8,12 +8,14 @@ const ROOT_DIR = path.resolve(process.env.TRANSCODE_DIR || '/tmp/sny-transcoder'
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 1);
 const IDLE_TTL_MS = Math.max(60, Number(process.env.JOB_IDLE_TTL_SECONDS) || 300) * 1000;
 const STARTUP_TIMEOUT_MS = Math.max(20, Number(process.env.JOB_STARTUP_TIMEOUT_SECONDS) || 75) * 1000;
+const MIN_READY_SEGMENTS = Math.min(4, Math.max(1, Number(process.env.MIN_READY_SEGMENTS) || 2));
 const MAX_HEIGHT = Math.min(2160, Math.max(360, Number(process.env.TRANSCODE_MAX_HEIGHT) || 1080));
 const VIDEO_BITRATE = String(process.env.TRANSCODE_VIDEO_BITRATE || '5000k');
 const AUDIO_BITRATE = String(process.env.TRANSCODE_AUDIO_BITRATE || '160k');
 const PRESET = String(process.env.TRANSCODE_PRESET || 'veryfast');
 const PUBLIC_URL = String(process.env.TRANSCODER_PUBLIC_URL || '').replace(/\/+$/, '');
 const jobs = new Map();
+const jobBySourceKey = new Map();
 
 function activeJobCount() {
   return [...jobs.values()].filter(job => !['stopped', 'failed', 'complete'].includes(job.state)).length;
@@ -26,6 +28,18 @@ function appendLog(job, chunk) {
 
 function safeRemoveDirectory(directory) {
   try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
+}
+
+function publicJobPayload(job) {
+  const token = createPlaybackToken(job.id);
+  return {
+    jobId: job.id,
+    hlsUrl: `${PUBLIC_URL}/hls/${encodeURIComponent(job.id)}/index.m3u8?token=${encodeURIComponent(token)}`,
+    state: job.state,
+    output: 'H.264 video + AAC audio',
+    maxHeight: MAX_HEIGHT,
+    startSeconds: job.startSeconds
+  };
 }
 
 function buildFfmpegArgs(sourceUrl, outputDirectory, startSeconds) {
@@ -93,7 +107,19 @@ function waitForPlaylist(job) {
 
       try {
         const playlist = fs.readFileSync(playlistPath, 'utf8');
-        if (playlist.includes('#EXTINF:') && /segment_\d+\.ts/.test(playlist)) {
+        const listedSegments = [...playlist.matchAll(/^(segment_\d+\.ts)$/gm)].map(match => match[1]);
+        const completeSegments = listedSegments.filter(filename => {
+          try {
+            return fs.statSync(path.join(job.directory, filename)).size > 0;
+          } catch {
+            return false;
+          }
+        });
+        if (
+          playlist.includes('#EXTM3U')
+          && playlist.includes('#EXTINF:')
+          && completeSegments.length >= MIN_READY_SEGMENTS
+        ) {
           clearInterval(timer);
           job.state = 'ready';
           job.readyAt = Date.now();
@@ -116,6 +142,7 @@ export function getWorkerStatus() {
     activeJobs: activeJobCount(),
     totalJobs: jobs.size,
     maxConcurrentJobs: MAX_CONCURRENT_JOBS,
+    minReadySegments: MIN_READY_SEGMENTS,
     maxHeight: MAX_HEIGHT,
     output: 'HLS / H.264 / AAC'
   };
@@ -127,20 +154,36 @@ export async function createJob({ sourceUrl, startSeconds = 0 }) {
     error.statusCode = 503;
     throw error;
   }
+  const validatedUrl = await validateSourceUrl(sourceUrl);
+  const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
+  const sourceKey = crypto
+    .createHash('sha256')
+    .update(`${validatedUrl}|${safeStartSeconds}`)
+    .digest('hex');
+  const existingId = jobBySourceKey.get(sourceKey);
+  const existing = existingId ? jobs.get(existingId) : null;
+
+  if (existing && ['starting', 'ready', 'complete'].includes(existing.state)) {
+    existing.lastAccessAt = Date.now();
+    if (existing.state === 'starting') await waitForPlaylist(existing);
+    return publicJobPayload(existing);
+  }
+
   if (activeJobCount() >= MAX_CONCURRENT_JOBS) {
     const error = new Error('The compatibility server is currently busy. Try again shortly.');
     error.statusCode = 429;
+    error.code = 'TRANSCODER_BUSY';
+    error.retryable = true;
     throw error;
   }
 
-  const validatedUrl = await validateSourceUrl(sourceUrl);
-  const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
   const id = crypto.randomBytes(18).toString('base64url');
   const directory = path.join(ROOT_DIR, id);
   fs.mkdirSync(directory, { recursive: true });
 
   const job = {
     id,
+    sourceKey,
     directory,
     sourceUrl: validatedUrl,
     startSeconds: safeStartSeconds,
@@ -153,6 +196,7 @@ export async function createJob({ sourceUrl, startSeconds = 0 }) {
     process: null
   };
   jobs.set(id, job);
+  jobBySourceKey.set(sourceKey, id);
 
   const args = buildFfmpegArgs(validatedUrl, directory, safeStartSeconds);
   const child = spawn('ffmpeg', args, {
@@ -185,15 +229,7 @@ export async function createJob({ sourceUrl, startSeconds = 0 }) {
     throw wrapped;
   }
 
-  const token = createPlaybackToken(id);
-  return {
-    jobId: id,
-    hlsUrl: `${PUBLIC_URL}/hls/${encodeURIComponent(id)}/index.m3u8?token=${encodeURIComponent(token)}`,
-    state: job.state,
-    output: 'H.264 video + AAC audio',
-    maxHeight: MAX_HEIGHT,
-    startSeconds: safeStartSeconds
-  };
+  return publicJobPayload(job);
 }
 
 export function getJob(jobId) {
@@ -213,6 +249,7 @@ export async function stopJob(jobId) {
     }, 3_000).unref();
   }
   jobs.delete(jobId);
+  if (jobBySourceKey.get(job.sourceKey) === jobId) jobBySourceKey.delete(job.sourceKey);
   safeRemoveDirectory(job.directory);
   return true;
 }
