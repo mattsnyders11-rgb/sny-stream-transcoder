@@ -1,0 +1,4 @@
+SNY Stream Decoder / Transcoder Worker — last version from this chat
+
+Use this as the Railway service root for the decoder/transcoder service.
+The Railway Root Directory should point to this folder's contents (previously /transcoder-worker).
