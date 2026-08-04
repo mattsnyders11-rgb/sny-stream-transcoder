@@ -8,14 +8,12 @@ const ROOT_DIR = path.resolve(process.env.TRANSCODE_DIR || '/tmp/sny-transcoder'
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 1);
 const IDLE_TTL_MS = Math.max(60, Number(process.env.JOB_IDLE_TTL_SECONDS) || 300) * 1000;
 const STARTUP_TIMEOUT_MS = Math.max(20, Number(process.env.JOB_STARTUP_TIMEOUT_SECONDS) || 75) * 1000;
-const MIN_READY_SEGMENTS = Math.min(4, Math.max(1, Number(process.env.MIN_READY_SEGMENTS) || 2));
 const MAX_HEIGHT = Math.min(2160, Math.max(360, Number(process.env.TRANSCODE_MAX_HEIGHT) || 1080));
 const VIDEO_BITRATE = String(process.env.TRANSCODE_VIDEO_BITRATE || '5000k');
 const AUDIO_BITRATE = String(process.env.TRANSCODE_AUDIO_BITRATE || '160k');
 const PRESET = String(process.env.TRANSCODE_PRESET || 'veryfast');
 const PUBLIC_URL = String(process.env.TRANSCODER_PUBLIC_URL || '').replace(/\/+$/, '');
 const jobs = new Map();
-const jobBySourceKey = new Map();
 
 function activeJobCount() {
   return [...jobs.values()].filter(job => !['stopped', 'failed', 'complete'].includes(job.state)).length;
@@ -30,22 +28,15 @@ function safeRemoveDirectory(directory) {
   try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
 }
 
-function publicJobPayload(job) {
-  const token = createPlaybackToken(job.id);
-  return {
-    jobId: job.id,
-    hlsUrl: `${PUBLIC_URL}/hls/${encodeURIComponent(job.id)}/index.m3u8?token=${encodeURIComponent(token)}`,
-    state: job.state,
-    output: 'H.264 video + AAC audio',
-    maxHeight: MAX_HEIGHT,
-    startSeconds: job.startSeconds
-  };
-}
-
-function buildFfmpegArgs(sourceUrl, outputDirectory, startSeconds) {
-  const segmentPattern = path.join(outputDirectory, 'segment_%06d.ts');
+export function buildFfmpegArgs(sourceUrl, outputDirectory, startSeconds) {
+  const segmentPattern = path.join(outputDirectory, 'segment_%06d.m4s');
   const playlistPath = path.join(outputDirectory, 'index.m3u8');
-  const scaleFilter = `scale=w=-2:h='min(${MAX_HEIGHT},ih)':force_original_aspect_ratio=decrease,format=yuv420p`;
+  const scaleFilter = [
+    `scale=w=-2:h='min(${MAX_HEIGHT},ih)':force_original_aspect_ratio=decrease:flags=lanczos`,
+    'fps=30:round=near',
+    'setsar=1',
+    'format=yuv420p'
+  ].join(',');
 
   const args = [
     '-hide_banner',
@@ -74,19 +65,24 @@ function buildFfmpegArgs(sourceUrl, outputDirectory, startSeconds) {
     '-b:v', VIDEO_BITRATE,
     '-maxrate', VIDEO_BITRATE,
     '-bufsize', '10000k',
-    '-g', '96',
-    '-keyint_min', '96',
+    '-g', '60',
+    '-keyint_min', '60',
     '-sc_threshold', '0',
-    '-force_key_frames', 'expr:gte(t,n_forced*4)',
+    '-force_key_frames', 'expr:gte(t,n_forced*2)',
     '-c:a', 'aac',
+    '-profile:a', 'aac_low',
     '-b:a', AUDIO_BITRATE,
     '-ac', '2',
     '-ar', '48000',
+    '-af', 'aresample=async=1:first_pts=0',
+    '-max_muxing_queue_size', '2048',
     '-f', 'hls',
-    '-hls_time', '4',
+    '-hls_time', '2',
     '-hls_list_size', '0',
     '-hls_playlist_type', 'event',
     '-hls_flags', 'independent_segments+temp_file',
+    '-hls_segment_type', 'fmp4',
+    '-hls_fmp4_init_filename', 'init.mp4',
     '-hls_segment_filename', segmentPattern,
     playlistPath
   );
@@ -107,18 +103,10 @@ function waitForPlaylist(job) {
 
       try {
         const playlist = fs.readFileSync(playlistPath, 'utf8');
-        const listedSegments = [...playlist.matchAll(/^(segment_\d+\.ts)$/gm)].map(match => match[1]);
-        const completeSegments = listedSegments.filter(filename => {
-          try {
-            return fs.statSync(path.join(job.directory, filename)).size > 0;
-          } catch {
-            return false;
-          }
-        });
         if (
-          playlist.includes('#EXTM3U')
+          playlist.includes('#EXT-X-MAP:URI="init.mp4"')
           && playlist.includes('#EXTINF:')
-          && completeSegments.length >= MIN_READY_SEGMENTS
+          && /segment_\d+\.m4s/.test(playlist)
         ) {
           clearInterval(timer);
           job.state = 'ready';
@@ -142,9 +130,11 @@ export function getWorkerStatus() {
     activeJobs: activeJobCount(),
     totalJobs: jobs.size,
     maxConcurrentJobs: MAX_CONCURRENT_JOBS,
-    minReadySegments: MIN_READY_SEGMENTS,
     maxHeight: MAX_HEIGHT,
-    output: 'HLS / H.264 / AAC'
+    output: 'HLS fMP4 / H.264 High 4.1 / AAC-LC stereo',
+    segmentSeconds: 2,
+    pixelFormat: 'yuv420p',
+    maxFrameRate: 30
   };
 }
 
@@ -154,36 +144,20 @@ export async function createJob({ sourceUrl, startSeconds = 0 }) {
     error.statusCode = 503;
     throw error;
   }
-  const validatedUrl = await validateSourceUrl(sourceUrl);
-  const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
-  const sourceKey = crypto
-    .createHash('sha256')
-    .update(`${validatedUrl}|${safeStartSeconds}`)
-    .digest('hex');
-  const existingId = jobBySourceKey.get(sourceKey);
-  const existing = existingId ? jobs.get(existingId) : null;
-
-  if (existing && ['starting', 'ready', 'complete'].includes(existing.state)) {
-    existing.lastAccessAt = Date.now();
-    if (existing.state === 'starting') await waitForPlaylist(existing);
-    return publicJobPayload(existing);
-  }
-
   if (activeJobCount() >= MAX_CONCURRENT_JOBS) {
     const error = new Error('The compatibility server is currently busy. Try again shortly.');
     error.statusCode = 429;
-    error.code = 'TRANSCODER_BUSY';
-    error.retryable = true;
     throw error;
   }
 
+  const validatedUrl = await validateSourceUrl(sourceUrl);
+  const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
   const id = crypto.randomBytes(18).toString('base64url');
   const directory = path.join(ROOT_DIR, id);
   fs.mkdirSync(directory, { recursive: true });
 
   const job = {
     id,
-    sourceKey,
     directory,
     sourceUrl: validatedUrl,
     startSeconds: safeStartSeconds,
@@ -196,7 +170,6 @@ export async function createJob({ sourceUrl, startSeconds = 0 }) {
     process: null
   };
   jobs.set(id, job);
-  jobBySourceKey.set(sourceKey, id);
 
   const args = buildFfmpegArgs(validatedUrl, directory, safeStartSeconds);
   const child = spawn('ffmpeg', args, {
@@ -229,7 +202,15 @@ export async function createJob({ sourceUrl, startSeconds = 0 }) {
     throw wrapped;
   }
 
-  return publicJobPayload(job);
+  const token = createPlaybackToken(id);
+  return {
+    jobId: id,
+    hlsUrl: `${PUBLIC_URL}/hls/${encodeURIComponent(id)}/index.m3u8?token=${encodeURIComponent(token)}`,
+    state: job.state,
+    output: 'HLS fMP4 + H.264 High 4.1 + AAC-LC stereo',
+    maxHeight: MAX_HEIGHT,
+    startSeconds: safeStartSeconds
+  };
 }
 
 export function getJob(jobId) {
@@ -249,7 +230,6 @@ export async function stopJob(jobId) {
     }, 3_000).unref();
   }
   jobs.delete(jobId);
-  if (jobBySourceKey.get(job.sourceKey) === jobId) jobBySourceKey.delete(job.sourceKey);
   safeRemoveDirectory(job.directory);
   return true;
 }

@@ -1,28 +1,29 @@
-# SNY Stream FFmpeg HLS Worker
+# SNY Stream Universal Device Playback Worker v1.8
 
-This is the separate Compatibility Mode service. It can live in its own
-repository or in the existing SNY Stream repository under
-`/SNY_STREAM_FFMPEG_HLS_WORKER`. Real-Debrid files use Real-Debrid's own
-browser-native streams and are deliberately rejected by this worker.
+This is the separate Compatibility Mode service. It is not uploaded into the
+existing SNY Stream repository.
 
 ## What it does
 
 1. Receives an authenticated request from the main SNY Stream server.
-2. Opens the exact authorised non-Real-Debrid source the viewer selected.
-3. Uses FFmpeg to convert video to H.264 and audio to AAC.
-4. Packages the result as four-second HLS segments.
-5. Returns a temporary signed HLS URL to the SNY Stream player.
-6. Stops and removes the temporary session after playback closes or becomes idle.
+2. Opens the exact source the viewer selected.
+3. Uses FFmpeg to convert video to H.264 High 4.1, 8-bit `yuv420p`, at a
+   maximum of 1080p and 30 fps.
+4. Converts audio to AAC-LC, 48 kHz, two-channel stereo.
+5. Packages the result as HLS with a fragmented-MP4 initialization file and
+   two-second `.m4s` media segments.
+6. Returns a temporary signed HLS URL to the SNY Stream player.
+7. Stops and removes the temporary session after playback closes or becomes idle.
 
 The worker does not search for, filter, hide, or replace sources.
 
 ## GitHub and Railway deployment
 
-1. Keep the current repository arrangement.
-2. If this folder is inside the main repository, set Railway Root Directory to
-   `/SNY_STREAM_FFMPEG_HLS_WORKER`. If it has its own repository, upload this
-   folder's contents to that repository root.
-3. Keep the existing transcoder Railway service connected to that location.
+1. Create a new GitHub repository named `sny-stream-transcoder`.
+2. Upload the contents of this folder to the root of the new repository.
+   `Dockerfile`, `package.json`, and `railway.json` must be at repository root.
+3. In the existing SNY Stream Railway project, create a new service from that
+   repository.
 4. Name the Railway service `sny-transcoder`.
 5. In Railway networking, generate a public domain for the worker.
 6. Add the variables below.
@@ -52,7 +53,6 @@ TRANSCODE_DIR=/tmp/sny-transcoder
 MAX_CONCURRENT_JOBS=1
 JOB_IDLE_TTL_SECONDS=300
 JOB_STARTUP_TIMEOUT_SECONDS=75
-MIN_READY_SEGMENTS=2
 TRANSCODE_MAX_HEIGHT=1080
 TRANSCODE_VIDEO_BITRATE=5000k
 TRANSCODE_AUDIO_BITRATE=160k
@@ -81,9 +81,6 @@ If you choose a different Railway service name, use that exact name in the
 - Source URL validation.
 - Private and reserved destination blocking.
 - One simultaneous transcode by default.
-- Identical concurrent requests share one job.
-- Playback is returned only after two complete HLS segments exist.
-- Real-Debrid download URLs are rejected in favour of provider-native playback.
 - Automatic idle cleanup.
 - Automatic FFmpeg termination when a player closes.
 - CORS restricted to the SNY Stream website.
@@ -101,7 +98,10 @@ A healthy response includes:
 ```json
 {
   "ok": true,
-  "output": "HLS / H.264 / AAC",
+  "output": "HLS fMP4 / H.264 High 4.1 / AAC-LC stereo",
+  "segmentSeconds": 2,
+  "pixelFormat": "yuv420p",
+  "maxFrameRate": 30,
   "maxConcurrentJobs": 1
 }
 ```
@@ -111,5 +111,23 @@ A healthy response includes:
 The Dockerfile installs FFmpeg automatically. No FFmpeg installation is
 required on a viewer's computer.
 
-This first beta uses CPU transcoding. Start with one active session and
-measure Railway resource use before increasing concurrency.
+This version uses CPU transcoding. Keep one active Compatibility Mode job on
+small Railway instances. Increase `MAX_CONCURRENT_JOBS` only after CPU and
+memory measurements show that the worker can encode every stream in real time.
+
+## Locked compatibility profile
+
+```text
+Delivery: HLS version 7
+Segments: fragmented MP4 (.m4s), 2 seconds
+Video: H.264/AVC High profile, Level 4.1
+Video pixel format: yuv420p, 8-bit
+Maximum output: 1920x1080 at 30 fps
+Audio: AAC-LC, 48 kHz, stereo
+Subtitles: excluded from the compatibility rendition
+```
+
+Safari/iPhone plays this HLS stream natively. Chrome, Edge and Firefox use the
+vendored HLS.js player already included in SNY Stream. The main website first
+tries a resolved direct/provider-native source and automatically starts this
+worker after an unsupported-source error or startup timeout.

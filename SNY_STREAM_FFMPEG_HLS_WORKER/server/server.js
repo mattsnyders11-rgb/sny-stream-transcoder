@@ -3,6 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { createJob, getJob, getWorkerStatus, stopJob } from './job-manager.js';
+import { hlsContentType, isAllowedHlsFilename, rewritePlaylist } from './hls.js';
 import { verifyPlaybackToken, verifySharedSecret } from './security.js';
 
 const HOST = process.env.HOST || '::';
@@ -51,15 +52,6 @@ async function readJson(req) {
   });
 }
 
-function rewritePlaylist(text, token) {
-  return text.split(/\r?\n/).map(line => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) return line;
-    const separator = trimmed.includes('?') ? '&' : '?';
-    return `${trimmed}${separator}token=${encodeURIComponent(token)}`;
-  }).join('\n');
-}
-
 function serveHls(req, res, pathname, searchParams) {
   setCors(req, res);
   if (req.method === 'OPTIONS') {
@@ -69,9 +61,10 @@ function serveHls(req, res, pathname, searchParams) {
   }
   if (!['GET', 'HEAD'].includes(req.method)) return sendText(res, 405, 'Method not allowed');
 
-  const match = pathname.match(/^\/hls\/([A-Za-z0-9_-]{12,80})\/(index\.m3u8|segment_\d{6}\.ts)$/);
+  const match = pathname.match(/^\/hls\/([A-Za-z0-9_-]{12,80})\/([^/]+)$/);
   if (!match) return sendText(res, 404, 'Not found');
   const [, jobId, filename] = match;
+  if (!isAllowedHlsFilename(filename)) return sendText(res, 404, 'Not found');
   const token = searchParams.get('token') || '';
   if (!verifyPlaybackToken(jobId, token)) return sendText(res, 403, 'Invalid playback token');
 
@@ -101,7 +94,7 @@ function serveHls(req, res, pathname, searchParams) {
   catch { return sendText(res, job.state === 'failed' ? 502 : 404, job.error || 'Segment is not ready.'); }
 
   res.writeHead(200, {
-    'Content-Type': 'video/mp2t',
+    'Content-Type': hlsContentType(filename),
     'Content-Length': stat.size,
     'Cache-Control': 'public, max-age=31536000, immutable',
     'Access-Control-Allow-Origin': res.getHeader('Access-Control-Allow-Origin') || ALLOWED_ORIGIN,
@@ -147,11 +140,7 @@ const server = http.createServer((req, res) => {
   Promise.resolve(handleRequest(req, res)).catch(error => {
     console.error('Transcoder request failed:', error);
     if (!res.headersSent) {
-      sendJson(res, Number(error.statusCode) || 500, {
-        error: error.message || 'Transcoder error.',
-        code: error.code || 'TRANSCODER_ERROR',
-        retryable: error.retryable !== false
-      });
+      sendJson(res, Number(error.statusCode) || 500, { error: error.message || 'Transcoder error.' });
     } else if (!res.writableEnded) {
       res.end();
     }
@@ -160,7 +149,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`SNY Stream transcoder listening on ${HOST}:${PORT}`);
-  console.log(`Output: HLS / H.264 / AAC | Max jobs: ${getWorkerStatus().maxConcurrentJobs}`);
+  console.log(`Output: ${getWorkerStatus().output} | Max jobs: ${getWorkerStatus().maxConcurrentJobs}`);
 });
 
 function shutdown() {
