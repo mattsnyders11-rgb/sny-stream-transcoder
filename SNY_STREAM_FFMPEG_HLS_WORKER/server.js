@@ -34,6 +34,12 @@ function clampInt(value, min, max, fallback) {
   return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
 }
 
+function optionalNonNegativeInteger(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -220,7 +226,7 @@ async function probeSource(sourceUrl, { useCache = true } = {}) {
       '-show_entries', 'format=format_name,duration:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,channels,channel_layout:stream_tags=language,title,handler_name:stream_disposition=default,comment,descriptions,visual_impaired,hearing_impaired',
       '-of', 'json',
       sourceUrl
-    ], { timeoutMs: 15_000 });
+    ], { timeoutMs: 25_000 });
 
     const data = JSON.parse(stdout || '{}');
     const streams = Array.isArray(data.streams) ? data.streams : [];
@@ -276,6 +282,36 @@ function publicProbePayload(probe) {
   };
 }
 
+function selectProbeAudioTrack(probe, requestedAudioStreamIndex = null) {
+  const requested = optionalNonNegativeInteger(requestedAudioStreamIndex);
+  const hasExplicitSelection = requested !== null;
+
+  if (!hasExplicitSelection) {
+    if (!probe.probeError) assertEnglishPreferredAudio(probe.audioAnalysis);
+    return probe;
+  }
+
+  const track = Array.isArray(probe.audioAnalysis?.tracks)
+    ? probe.audioAnalysis.tracks.find(candidate => Number(candidate?.index) === requested)
+    : null;
+  if (!track?.stream) {
+    throw Object.assign(new Error('The requested audio track is no longer available in this source.'), {
+      statusCode: 409,
+      code: 'AUDIO_TRACK_NOT_FOUND',
+      retryable: true
+    });
+  }
+
+  return {
+    ...probe,
+    audio: track.stream,
+    audioAnalysis: {
+      ...probe.audioAnalysis,
+      selected: track
+    }
+  };
+}
+
 function selectMode(probe) {
   const videoCodec = String(probe.video?.codec_name || '').toLowerCase();
   const pixelFormat = String(probe.video?.pix_fmt || '').toLowerCase();
@@ -302,7 +338,8 @@ function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode }) {
   ];
 
   if (startSeconds > 0) args.push('-ss', String(startSeconds));
-  const audioMap = Number.isInteger(Number(probe.audio?.index)) ? `0:${Number(probe.audio.index)}?` : '0:a:0?';
+  const selectedAudioIndex = optionalNonNegativeInteger(probe.audio?.index);
+  const audioMap = selectedAudioIndex !== null ? `0:${selectedAudioIndex}?` : '0:a:0?';
   args.push('-i', sourceUrl, '-map', '0:v:0', '-map', audioMap, '-sn', '-dn');
 
   if (mode === 'remux' || mode === 'audio-transcode') {
@@ -363,6 +400,7 @@ function jobPublicPayload(job) {
       audioTitle: job.probe.audioAnalysis?.selected?.title || null,
       audioSelectionStatus: job.probe.audioAnalysis?.status || 'unverified',
       audioStreamIndex: Number.isInteger(job.probe.audioAnalysis?.selected?.index) ? job.probe.audioAnalysis.selected.index : null,
+      audioTracks: publicAudioAnalysis(job.probe.audioAnalysis || {}).tracks,
       width: Number(job.probe.video?.width) || null,
       height: Number(job.probe.video?.height) || null
     }
@@ -421,10 +459,13 @@ function waitForPlaylist(job) {
   });
 }
 
-async function createJob({ sourceUrl, startSeconds }) {
+async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
   const validatedUrl = await validateSourceUrl(sourceUrl);
   const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
-  const sourceKey = crypto.createHash('sha256').update(`${validatedUrl}|${safeStartSeconds}`).digest('hex');
+  const requestedAudioStreamIndex = optionalNonNegativeInteger(audioStreamIndex);
+  const sourceKey = crypto.createHash('sha256')
+    .update(`${validatedUrl}|${safeStartSeconds}|${requestedAudioStreamIndex ?? 'auto'}`)
+    .digest('hex');
   const existingId = jobBySourceKey.get(sourceKey);
   const existing = existingId ? jobs.get(existingId) : null;
   if (existing && ['starting', 'running', 'completed'].includes(existing.state)) {
@@ -441,8 +482,8 @@ async function createJob({ sourceUrl, startSeconds }) {
     });
   }
 
-  const probe = await probeSource(validatedUrl);
-  if (!probe.probeError) assertEnglishPreferredAudio(probe.audioAnalysis);
+  const baseProbe = await probeSource(validatedUrl);
+  const probe = selectProbeAudioTrack(baseProbe, requestedAudioStreamIndex);
   const mode = selectMode(probe);
   const id = crypto.randomBytes(18).toString('base64url');
   const outputDir = path.join(WORK_ROOT, id);
@@ -559,9 +600,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         status: 'ok',
         service: 'sny-stream-transcoder',
-        version: '1.1.0',
+        version: '1.2.0',
         ffmpeg: true,
-        audioGuard: 'english-preferred',
+        audioGuard: 'english-preferred-with-selector',
         activeJobs: activeJobCount(),
         maxActiveJobs: MAX_ACTIVE_JOBS
       });

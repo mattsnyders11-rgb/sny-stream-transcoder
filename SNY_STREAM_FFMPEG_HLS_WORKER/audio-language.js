@@ -115,8 +115,28 @@ export function analyseAudioStreams(streams = []) {
   };
 }
 
+function publicAudioTrack(track = {}) {
+  return {
+    streamIndex: Number.isInteger(track?.index) ? track.index : null,
+    language: track?.language || null,
+    normalisedLanguage: track?.normalisedLanguage || null,
+    title: track?.title || null,
+    codec: track?.codec || null,
+    channels: Number(track?.channels) || null,
+    channelLayout: track?.channelLayout || null,
+    isEnglish: Boolean(track?.isEnglish),
+    languageKnown: Boolean(track?.languageKnown),
+    isDefault: Boolean(track?.isDefault),
+    isCommentary: Boolean(track?.isCommentary),
+    isDescription: Boolean(track?.isDescription)
+  };
+}
+
 export function publicAudioAnalysis(analysis = {}) {
   const selected = analysis.selected || null;
+  const tracks = Array.isArray(analysis.tracks)
+    ? analysis.tracks.map(publicAudioTrack).filter(track => track.streamIndex !== null)
+    : [];
   return {
     status: analysis.status || 'unverified',
     hasAudio: Boolean(analysis.hasAudio),
@@ -134,7 +154,8 @@ export function publicAudioAnalysis(analysis = {}) {
     selectedIsDefault: Boolean(selected?.isDefault),
     selectedIsCommentary: Boolean(selected?.isCommentary),
     selectedIsDescription: Boolean(selected?.isDescription),
-    trackCount: Array.isArray(analysis.tracks) ? analysis.tracks.length : 0
+    trackCount: tracks.length,
+    tracks
   };
 }
 
