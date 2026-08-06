@@ -1,9 +1,9 @@
 {
   "name": "sny-stream-transcoder-worker",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
-  "description": "SNY Stream Universal Playback Engine with English Audio Guard and selectable audio-track output.",
+  "description": "SNY Stream Universal Playback Engine with English Audio Guard with prebuffered, selectable audio-track output.",
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check audio-language.js"
