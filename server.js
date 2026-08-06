@@ -15,9 +15,11 @@ const SECRET = String(process.env.TRANSCODER_SECRET || '').trim();
 const MAX_ACTIVE_JOBS = clampInt(process.env.MAX_ACTIVE_JOBS, 1, 8, 2);
 const JOB_TTL_MS = clampInt(process.env.JOB_TTL_SECONDS, 300, 86_400, 7200) * 1000;
 const STARTUP_READY_TIMEOUT_MS = clampInt(process.env.STARTUP_READY_TIMEOUT_SECONDS, 10, 90, 28) * 1000;
+const INITIAL_READY_TIMEOUT_MS = clampInt(process.env.INITIAL_READY_TIMEOUT_SECONDS, 20, 120, 60) * 1000;
 const SEGMENT_SECONDS = clampInt(process.env.SEGMENT_SECONDS, 2, 10, 4);
 const MIN_READY_SEGMENTS = clampInt(process.env.MIN_READY_SEGMENTS, 2, 8, 3);
 const MIN_HANDOFF_BUFFER_SECONDS = clampInt(process.env.MIN_HANDOFF_BUFFER_SECONDS, 2, 20, 4);
+const MIN_INITIAL_BUFFER_SECONDS = clampInt(process.env.MIN_INITIAL_BUFFER_SECONDS, 6, 30, 12);
 const MAX_OUTPUT_WIDTH = clampInt(process.env.MAX_OUTPUT_WIDTH, 640, 3840, 1920);
 const VIDEO_CRF = clampInt(process.env.VIDEO_CRF, 16, 32, 22);
 const FFMPEG_PRESET = /^[a-z0-9-]+$/i.test(String(process.env.FFMPEG_PRESET || ''))
@@ -423,6 +425,8 @@ function jobPublicPayload(job) {
       segmentSeconds: SEGMENT_SECONDS,
       minimumReadySegments: MIN_READY_SEGMENTS,
       minimumHandoffBufferSeconds: MIN_HANDOFF_BUFFER_SECONDS,
+      minimumInitialBufferSeconds: MIN_INITIAL_BUFFER_SECONDS,
+      initialReadyTimeoutSeconds: Math.round(INITIAL_READY_TIMEOUT_MS / 1000),
       readySegmentCount: readiness.segmentCount,
       readyDurationSeconds: readiness.readyDurationSeconds,
       handoffBufferSeconds: Math.max(0, readiness.readyDurationSeconds - ((Date.now() - job.createdAt) / 1000)),
@@ -457,9 +461,9 @@ function removeJob(job, { deleteFiles = true } = {}) {
   if (deleteFiles) fs.rm(job.outputDir, { recursive: true, force: true }, () => {});
 }
 
-function waitForPlaylist(job) {
+function waitForPlaylist(job, { readinessMode = 'initial' } = {}) {
   return new Promise((resolve, reject) => {
-    const deadline = Date.now() + STARTUP_READY_TIMEOUT_MS;
+    const deadline = Date.now() + (readinessMode === 'handoff' ? STARTUP_READY_TIMEOUT_MS : INITIAL_READY_TIMEOUT_MS);
     const poll = () => {
       if (!jobs.has(job.id)) return reject(Object.assign(new Error('The compatibility job was cancelled.'), { statusCode: 410 }));
 
@@ -467,10 +471,15 @@ function waitForPlaylist(job) {
         const readiness = readPlaylistReadiness(job);
         const elapsedSeconds = Math.max(0, (Date.now() - job.createdAt) / 1000);
         const handoffBufferSeconds = readiness.readyDurationSeconds - elapsedSeconds;
-        const enoughBufferedSegments = readiness.segmentCount >= MIN_READY_SEGMENTS
+        const enoughInitialBuffer = readiness.segmentCount >= MIN_READY_SEGMENTS
+          && readiness.readyDurationSeconds >= MIN_INITIAL_BUFFER_SECONDS;
+        const enoughHandoffBuffer = readiness.segmentCount >= MIN_READY_SEGMENTS
           && handoffBufferSeconds >= MIN_HANDOFF_BUFFER_SECONDS;
+        const readinessSatisfied = readinessMode === 'handoff'
+          ? enoughHandoffBuffer
+          : enoughInitialBuffer;
         const completedShortStream = readiness.completed && readiness.segmentCount > 0;
-        if (readiness.hasPlaylist && (enoughBufferedSegments || completedShortStream)) {
+        if (readiness.hasPlaylist && (readinessSatisfied || completedShortStream)) {
           job.state = readiness.completed ? 'completed' : 'running';
           job.readyAt = Date.now();
           return resolve(jobPublicPayload(job));
@@ -500,10 +509,11 @@ function waitForPlaylist(job) {
   });
 }
 
-async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
+async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null, readinessMode = 'initial' }) {
   const validatedUrl = await validateSourceUrl(sourceUrl);
   const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
   const requestedAudioStreamIndex = optionalNonNegativeInteger(audioStreamIndex);
+  const safeReadinessMode = readinessMode === 'handoff' ? 'handoff' : 'initial';
   const sourceKey = crypto.createHash('sha256')
     .update(`${validatedUrl}|${safeStartSeconds}|${requestedAudioStreamIndex ?? 'auto'}`)
     .digest('hex');
@@ -511,8 +521,17 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
   const existing = existingId ? jobs.get(existingId) : null;
   if (existing && ['starting', 'running', 'completed'].includes(existing.state)) {
     existing.lastAccessAt = Date.now();
-    if (existing.state === 'running' || existing.state === 'completed') return jobPublicPayload(existing);
-    return waitForPlaylist(existing);
+    if (existing.state === 'running' || existing.state === 'completed') {
+      const readiness = readPlaylistReadiness(existing);
+      const elapsedSeconds = Math.max(0, (Date.now() - existing.createdAt) / 1000);
+      const ready = safeReadinessMode === 'handoff'
+        ? readiness.segmentCount >= MIN_READY_SEGMENTS
+          && (readiness.readyDurationSeconds - elapsedSeconds) >= MIN_HANDOFF_BUFFER_SECONDS
+        : readiness.segmentCount >= MIN_READY_SEGMENTS
+          && readiness.readyDurationSeconds >= MIN_INITIAL_BUFFER_SECONDS;
+      if (ready || (readiness.completed && readiness.segmentCount > 0)) return jobPublicPayload(existing);
+    }
+    return waitForPlaylist(existing, { readinessMode: safeReadinessMode });
   }
 
   if (activeJobCount() >= MAX_ACTIVE_JOBS) {
@@ -580,7 +599,7 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
   });
 
   console.log(`[transcoder] ${id} ${mode} ${job.sourceLogUrl}`);
-  return waitForPlaylist(job);
+  return waitForPlaylist(job, { readinessMode: safeReadinessMode });
 }
 
 function contentType(filename) {
@@ -642,14 +661,16 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         status: 'ok',
         service: 'sny-stream-transcoder',
-        version: '1.2.2',
+        version: '1.3.0',
         ffmpeg: true,
-        audioGuard: 'prebuffered-english-handoff',
+        audioGuard: 'english-ready-loading',
         activeJobs: activeJobCount(),
         maxActiveJobs: MAX_ACTIVE_JOBS,
         segmentSeconds: SEGMENT_SECONDS,
         minimumReadySegments: MIN_READY_SEGMENTS,
-        minimumHandoffBufferSeconds: MIN_HANDOFF_BUFFER_SECONDS
+        minimumHandoffBufferSeconds: MIN_HANDOFF_BUFFER_SECONDS,
+        minimumInitialBufferSeconds: MIN_INITIAL_BUFFER_SECONDS,
+        initialReadyTimeoutSeconds: Math.round(INITIAL_READY_TIMEOUT_MS / 1000)
       });
     }
 
