@@ -1,133 +1,32 @@
-# SNY Stream Universal Device Playback Worker v1.8
+# SNY Universal Playback Engine v1 — FFmpeg Worker
 
-This is the separate Compatibility Mode service. It is not uploaded into the
-existing SNY Stream repository.
+This service converts an authorised remote media URL into a Safari-compatible HLS stream:
 
-## What it does
+- H.264 video, maximum 1280 px width / 720p height
+- AAC stereo audio
+- fragmented-MP4 HLS segments
+- one active job by default
+- automatic cleanup after two hours
 
-1. Receives an authenticated request from the main SNY Stream server.
-2. Opens the exact source the viewer selected.
-3. Uses FFmpeg to convert video to H.264 High 4.1, 8-bit `yuv420p`, at a
-   maximum of 1080p and 30 fps.
-4. Converts audio to AAC-LC, 48 kHz, two-channel stereo.
-5. Packages the result as HLS with a fragmented-MP4 initialization file and
-   two-second `.m4s` media segments.
-6. Returns a temporary signed HLS URL to the SNY Stream player.
-7. Stops and removes the temporary session after playback closes or becomes idle.
+## Railway service variables
 
-The worker does not search for, filter, hide, or replace sources.
+- `TRANSCODER_SECRET`: same 24+ character random value used by the main SNY Stream service
+- `TRANSCODER_PUBLIC_URL`: public Railway URL of this worker, without trailing slash
+- `MAX_CONCURRENT_JOBS=1`
+- optional: `FFMPEG_PRESET=veryfast`, `FFMPEG_CRF=23`
 
-## GitHub and Railway deployment
+The main SNY Stream service needs:
 
-1. Create a new GitHub repository named `sny-stream-transcoder`.
-2. Upload the contents of this folder to the root of the new repository.
-   `Dockerfile`, `package.json`, and `railway.json` must be at repository root.
-3. In the existing SNY Stream Railway project, create a new service from that
-   repository.
-4. Name the Railway service `sny-transcoder`.
-5. In Railway networking, generate a public domain for the worker.
-6. Add the variables below.
-7. Deploy and open `/health` on the public worker domain. It should report
-   `"ok": true`.
+- `TRANSCODER_INTERNAL_URL`: the worker's Railway URL
+- `TRANSCODER_SECRET`: the same shared secret
+- `APP_SECRET`: an existing 24+ character secret
 
-## Required Railway variables
+This first version is deliberately a compatibility proof-of-concept. It transcodes one rendition rather than generating an adaptive quality ladder.
 
-```text
-HOST=::
-PORT=3002
-TRANSCODER_SECRET=USE-A-LONG-RANDOM-SECRET
-TRANSCODER_PUBLIC_URL=https://YOUR-WORKER-DOMAIN.up.railway.app
-ALLOWED_ORIGIN=https://snystream.co.za
-```
+## English Audio Guard (worker v1.1)
 
-`TRANSCODER_PUBLIC_URL` must be the worker's public HTTPS domain without a
-trailing slash. The browser needs this public address to fetch the HLS
-playlist and segments.
+The worker now probes all embedded audio tracks before HLS generation. It selects normal English ahead of commentary/descriptive English, maps the selected stream explicitly, and returns a retryable `ENGLISH_AUDIO_NOT_AVAILABLE` result for confirmed foreign-only files. Unknown language tags remain allowed as a fallback.
 
-Use the exact same `TRANSCODER_SECRET` in the main SNY Stream service.
+Optional variable:
 
-## Recommended first-beta variables
-
-```text
-TRANSCODE_DIR=/tmp/sny-transcoder
-MAX_CONCURRENT_JOBS=1
-JOB_IDLE_TTL_SECONDS=300
-JOB_STARTUP_TIMEOUT_SECONDS=75
-TRANSCODE_MAX_HEIGHT=1080
-TRANSCODE_VIDEO_BITRATE=5000k
-TRANSCODE_AUDIO_BITRATE=160k
-TRANSCODE_PRESET=veryfast
-```
-
-Do not set `ALLOW_PRIVATE_SOURCE_URLS=true` in production.
-
-## Main SNY Stream variables
-
-In the existing main service:
-
-```text
-TRANSCODER_INTERNAL_URL=http://sny-transcoder.railway.internal:3002
-TRANSCODER_SECRET=THE-SAME-SECRET-AS-THE-WORKER
-```
-
-If you choose a different Railway service name, use that exact name in the
-`.railway.internal` address.
-
-## Included safety controls
-
-- Shared-secret protection on job creation and deletion.
-- Short-lived signed media tickets from the main server.
-- Signed HLS playback URLs.
-- Source URL validation.
-- Private and reserved destination blocking.
-- One simultaneous transcode by default.
-- Automatic idle cleanup.
-- Automatic FFmpeg termination when a player closes.
-- CORS restricted to the SNY Stream website.
-
-## Health check
-
-Open:
-
-```text
-https://YOUR-WORKER-DOMAIN.up.railway.app/health
-```
-
-A healthy response includes:
-
-```json
-{
-  "ok": true,
-  "output": "HLS fMP4 / H.264 High 4.1 / AAC-LC stereo",
-  "segmentSeconds": 2,
-  "pixelFormat": "yuv420p",
-  "maxFrameRate": 30,
-  "maxConcurrentJobs": 1
-}
-```
-
-## Notes
-
-The Dockerfile installs FFmpeg automatically. No FFmpeg installation is
-required on a viewer's computer.
-
-This version uses CPU transcoding. Keep one active Compatibility Mode job on
-small Railway instances. Increase `MAX_CONCURRENT_JOBS` only after CPU and
-memory measurements show that the worker can encode every stream in real time.
-
-## Locked compatibility profile
-
-```text
-Delivery: HLS version 7
-Segments: fragmented MP4 (.m4s), 2 seconds
-Video: H.264/AVC High profile, Level 4.1
-Video pixel format: yuv420p, 8-bit
-Maximum output: 1920x1080 at 30 fps
-Audio: AAC-LC, 48 kHz, stereo
-Subtitles: excluded from the compatibility rendition
-```
-
-Safari/iPhone plays this HLS stream natively. Chrome, Edge and Firefox use the
-vendored HLS.js player already included in SNY Stream. The main website first
-tries a resolved direct/provider-native source and automatically starts this
-worker after an unsupported-source error or startup timeout.
+- `PROBE_CACHE_TTL_SECONDS=3600` caches audio-track inspection by resolved URL.

@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { analyseAudioStreams, assertEnglishPreferredAudio, publicAudioAnalysis } from './audio-language.js';
 
 const PORT = Math.max(1, Number(process.env.PORT) || 8080);
 const HOST = process.env.HOST || '::';
@@ -21,8 +22,10 @@ const FFMPEG_PRESET = /^[a-z0-9-]+$/i.test(String(process.env.FFMPEG_PRESET || '
   ? String(process.env.FFMPEG_PRESET)
   : 'veryfast';
 const ALLOW_PRIVATE_SOURCES = String(process.env.ALLOW_PRIVATE_SOURCES || '').toLowerCase() === 'true';
+const PROBE_CACHE_TTL_MS = clampInt(process.env.PROBE_CACHE_TTL_SECONDS, 60, 86_400, 3600) * 1000;
 
 const jobs = new Map();
+const probeCache = new Map();
 const jobBySourceKey = new Map();
 fs.mkdirSync(WORK_ROOT, { recursive: true });
 
@@ -185,27 +188,54 @@ function runCommand(command, args, { timeoutMs = 20_000 } = {}) {
   });
 }
 
-async function probeSource(sourceUrl) {
+function probeCacheKey(sourceUrl) {
+  return crypto.createHash('sha256').update(String(sourceUrl || '')).digest('hex');
+}
+
+function getCachedProbe(sourceUrl) {
+  const key = probeCacheKey(sourceUrl);
+  const cached = probeCache.get(key);
+  if (!cached || cached.expiresAt <= Date.now()) {
+    if (cached) probeCache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedProbe(sourceUrl, value) {
+  probeCache.set(probeCacheKey(sourceUrl), {
+    value,
+    expiresAt: Date.now() + PROBE_CACHE_TTL_MS
+  });
+}
+
+async function probeSource(sourceUrl, { useCache = true } = {}) {
+  const cached = useCache ? getCachedProbe(sourceUrl) : null;
+  if (cached) return cached;
+
   try {
     const { stdout } = await runCommand('ffprobe', [
       '-v', 'error',
       '-rw_timeout', '10000000',
-      '-show_entries', 'format=format_name,duration:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,channels,channel_layout',
+      '-show_entries', 'format=format_name,duration:stream=index,codec_type,codec_name,profile,pix_fmt,width,height,channels,channel_layout:stream_tags=language,title,handler_name:stream_disposition=default,comment,descriptions,visual_impaired,hearing_impaired',
       '-of', 'json',
       sourceUrl
-    ], { timeoutMs: 12_000 });
+    ], { timeoutMs: 15_000 });
 
     const data = JSON.parse(stdout || '{}');
     const streams = Array.isArray(data.streams) ? data.streams : [];
     const video = streams.find(stream => stream.codec_type === 'video') || null;
-    const audio = streams.find(stream => stream.codec_type === 'audio') || null;
-    return {
+    const audioAnalysis = analyseAudioStreams(streams);
+    const result = {
       available: Boolean(video),
       formatName: String(data.format?.format_name || ''),
       duration: Number(data.format?.duration) || null,
       video,
-      audio
+      audio: audioAnalysis.selected?.stream || null,
+      audioAnalysis
     };
+    setCachedProbe(sourceUrl, result);
+    return result;
   } catch (error) {
     return {
       available: false,
@@ -213,9 +243,37 @@ async function probeSource(sourceUrl) {
       duration: null,
       video: null,
       audio: null,
+      audioAnalysis: {
+        status: 'unverified',
+        hasAudio: false,
+        hasEnglish: false,
+        hasKnownForeign: false,
+        hasUnknownLanguage: true,
+        selected: null,
+        defaultAudioStreamIndex: null,
+        tracks: []
+      },
       probeError: error.message
     };
   }
+}
+
+function publicProbePayload(probe) {
+  return {
+    available: Boolean(probe?.available),
+    formatName: probe?.formatName || null,
+    duration: Number(probe?.duration) || null,
+    video: probe?.video ? {
+      index: Number.isInteger(Number(probe.video.index)) ? Number(probe.video.index) : null,
+      codec: probe.video.codec_name || null,
+      profile: probe.video.profile || null,
+      pixelFormat: probe.video.pix_fmt || null,
+      width: Number(probe.video.width) || null,
+      height: Number(probe.video.height) || null
+    } : null,
+    audio: publicAudioAnalysis(probe?.audioAnalysis || {}),
+    probeError: probe?.probeError || null
+  };
 }
 
 function selectMode(probe) {
@@ -244,7 +302,8 @@ function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode }) {
   ];
 
   if (startSeconds > 0) args.push('-ss', String(startSeconds));
-  args.push('-i', sourceUrl, '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn');
+  const audioMap = Number.isInteger(Number(probe.audio?.index)) ? `0:${Number(probe.audio.index)}?` : '0:a:0?';
+  args.push('-i', sourceUrl, '-map', '0:v:0', '-map', audioMap, '-sn', '-dn');
 
   if (mode === 'remux' || mode === 'audio-transcode') {
     args.push('-c:v', 'copy');
@@ -300,6 +359,10 @@ function jobPublicPayload(job) {
       format: job.probe.formatName || null,
       videoCodec: job.probe.video?.codec_name || null,
       audioCodec: job.probe.audio?.codec_name || null,
+      audioLanguage: job.probe.audioAnalysis?.selected?.language || null,
+      audioTitle: job.probe.audioAnalysis?.selected?.title || null,
+      audioSelectionStatus: job.probe.audioAnalysis?.status || 'unverified',
+      audioStreamIndex: Number.isInteger(job.probe.audioAnalysis?.selected?.index) ? job.probe.audioAnalysis.selected.index : null,
       width: Number(job.probe.video?.width) || null,
       height: Number(job.probe.video?.height) || null
     }
@@ -379,6 +442,7 @@ async function createJob({ sourceUrl, startSeconds }) {
   }
 
   const probe = await probeSource(validatedUrl);
+  if (!probe.probeError) assertEnglishPreferredAudio(probe.audioAnalysis);
   const mode = selectMode(probe);
   const id = crypto.randomBytes(18).toString('base64url');
   const outputDir = path.join(WORK_ROOT, id);
@@ -495,8 +559,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         status: 'ok',
         service: 'sny-stream-transcoder',
-        version: '1.0.0',
+        version: '1.1.0',
         ffmpeg: true,
+        audioGuard: 'english-preferred',
         activeJobs: activeJobCount(),
         maxActiveJobs: MAX_ACTIVE_JOBS
       });
@@ -504,6 +569,14 @@ const server = http.createServer(async (req, res) => {
 
     if (!pathname.startsWith('/v1/') || !isAuthorised(req)) {
       return sendJson(res, 401, { error: 'Unauthorised.', code: 'UNAUTHORISED' });
+    }
+
+    if (pathname === '/v1/probe' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const validatedUrl = await validateSourceUrl(body.sourceUrl);
+      const probe = await probeSource(validatedUrl);
+      if (!probe.probeError) assertEnglishPreferredAudio(probe.audioAnalysis);
+      return sendJson(res, 200, publicProbePayload(probe));
     }
 
     if (pathname === '/v1/jobs' && req.method === 'POST') {
@@ -546,6 +619,9 @@ const cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const job of jobs.values()) {
     if (now - job.lastAccessAt > JOB_TTL_MS) removeJob(job);
+  }
+  for (const [key, cached] of probeCache.entries()) {
+    if (!cached || cached.expiresAt <= now) probeCache.delete(key);
   }
 }, 60_000);
 cleanupTimer.unref?.();
