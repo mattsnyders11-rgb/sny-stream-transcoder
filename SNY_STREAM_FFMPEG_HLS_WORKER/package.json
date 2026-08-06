@@ -3,7 +3,7 @@
   "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "SNY Stream Universal Playback Engine with English Audio Guard and selectable audio-track output.",
+  "description": "SNY Stream Universal Playback Engine with on-demand selectable audio-track output.",
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check audio-language.js"

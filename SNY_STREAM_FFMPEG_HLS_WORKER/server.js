@@ -287,8 +287,19 @@ function selectProbeAudioTrack(probe, requestedAudioStreamIndex = null) {
   const hasExplicitSelection = requested !== null;
 
   if (!hasExplicitSelection) {
-    if (!probe.probeError) assertEnglishPreferredAudio(probe.audioAnalysis);
-    return probe;
+    const tracks = Array.isArray(probe.audioAnalysis?.tracks) ? probe.audioAnalysis.tracks : [];
+    const defaultIndex = optionalNonNegativeInteger(probe.audioAnalysis?.defaultAudioStreamIndex);
+    const defaultTrack = tracks.find(candidate => Number(candidate?.index) === defaultIndex)
+      || tracks[0]
+      || null;
+    return {
+      ...probe,
+      audio: defaultTrack?.stream || probe.audio || null,
+      audioAnalysis: {
+        ...probe.audioAnalysis,
+        selected: defaultTrack
+      }
+    };
   }
 
   const track = Array.isArray(probe.audioAnalysis?.tracks)
@@ -600,9 +611,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         status: 'ok',
         service: 'sny-stream-transcoder',
-        version: '1.2.0',
+        version: '1.2.1',
         ffmpeg: true,
-        audioGuard: 'english-preferred-with-selector',
+        audioGuard: 'manual-on-demand-selector',
         activeJobs: activeJobCount(),
         maxActiveJobs: MAX_ACTIVE_JOBS
       });
@@ -616,7 +627,6 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req);
       const validatedUrl = await validateSourceUrl(body.sourceUrl);
       const probe = await probeSource(validatedUrl);
-      if (!probe.probeError) assertEnglishPreferredAudio(probe.audioAnalysis);
       return sendJson(res, 200, publicProbePayload(probe));
     }
 

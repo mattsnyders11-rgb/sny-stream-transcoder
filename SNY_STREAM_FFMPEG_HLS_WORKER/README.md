@@ -23,7 +23,7 @@ The main SNY Stream service needs:
 
 This first version is deliberately a compatibility proof-of-concept. It transcodes one rendition rather than generating an adaptive quality ladder.
 
-## English Audio Guard (worker v1.1)
+## Manual Audio selector (worker v1.2.1)
 
 The worker now probes all embedded audio tracks before HLS generation. It selects normal English ahead of commentary/descriptive English, maps the selected stream explicitly, and returns a retryable `ENGLISH_AUDIO_NOT_AVAILABLE` result for confirmed foreign-only files. Unknown language tags remain allowed as a fallback.
 
