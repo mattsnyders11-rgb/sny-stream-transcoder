@@ -1,46 +1,32 @@
-# SNYStream Transcoder Worker v1.3.0
+# SNY Universal Playback Engine v1 — FFmpeg Worker
 
-This Railway service probes authorised remote media files and produces HLS playback with an explicitly selected audio track.
+This service converts an authorised remote media URL into a Safari-compatible HLS stream:
 
-## English-ready loading
+- H.264 video, maximum 1280 px width / 720p height
+- AAC stereo audio
+- fragmented-MP4 HLS segments
+- one active job by default
+- automatic cleanup after two hours
 
-v1.3.0 replaces the failed moving handoff with preparation behind the normal SNYStream loading screen:
+## Railway service variables
 
-- probes the embedded audio tracks before playback is shown;
-- selects normal English ahead of commentary or descriptive audio;
-- waits for at least three complete HLS segments;
-- waits for at least 12 seconds of initial buffered media by default;
-- reports the verified source duration and available audio tracks;
-- starts the player only after the English stream is ready.
+- `TRANSCODER_SECRET`: same 24+ character random value used by the main SNY Stream service
+- `TRANSCODER_PUBLIC_URL`: public Railway URL of this worker, without trailing slash
+- `MAX_CONCURRENT_JOBS=1`
+- optional: `FFMPEG_PRESET=veryfast`, `FFMPEG_CRF=23`
 
-Manual audio changes use the same loading-first process from the viewer's current timestamp.
+The main SNY Stream service needs:
 
-## Required variables
+- `TRANSCODER_INTERNAL_URL`: the worker's Railway URL
+- `TRANSCODER_SECRET`: the same shared secret
+- `APP_SECRET`: an existing 24+ character secret
 
-```text
-TRANSCODER_SECRET=<same 24+ character secret as the main service>
-MAX_ACTIVE_JOBS=2
-```
+This first version is deliberately a compatibility proof-of-concept. It transcodes one rendition rather than generating an adaptive quality ladder.
 
-`MAX_ACTIVE_JOBS=2` is recommended so an existing compatibility session can remain available while another selected audio track is prepared.
+## Manual Audio selector (worker v1.2.1)
 
-## Optional tuning
+The worker now probes all embedded audio tracks before HLS generation. It selects normal English ahead of commentary/descriptive English, maps the selected stream explicitly, and returns a retryable `ENGLISH_AUDIO_NOT_AVAILABLE` result for confirmed foreign-only files. Unknown language tags remain allowed as a fallback.
 
-```text
-MIN_READY_SEGMENTS=3
-MIN_INITIAL_BUFFER_SECONDS=12
-INITIAL_READY_TIMEOUT_SECONDS=60
-MIN_HANDOFF_BUFFER_SECONDS=4
-SEGMENT_SECONDS=4
-STARTUP_READY_TIMEOUT_SECONDS=28
-PROBE_CACHE_TTL_SECONDS=3600
-```
+Optional variable:
 
-The main SNYStream service also needs:
-
-```text
-TRANSCODER_INTERNAL_URL=<worker base URL>
-TRANSCODER_PUBLIC_URL=<worker public base URL>
-TRANSCODER_SECRET=<same shared secret>
-APP_SECRET=<stable 24+ character secret>
-```
+- `PROBE_CACHE_TTL_SECONDS=3600` caches audio-track inspection by resolved URL.
