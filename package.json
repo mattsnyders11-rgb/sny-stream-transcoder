@@ -1,6 +1,6 @@
 {
   "name": "sny-stream-transcoder-worker",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "description": "SNY Stream Universal Playback Engine with on-demand selectable audio-track output.",

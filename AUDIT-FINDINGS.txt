@@ -1,0 +1,8 @@
+Transcoder repository findings:
+- The repository contained three nested copies of the worker, including an old modular implementation.
+- Railway can deploy the wrong copy if Root Directory is changed or files are uploaded into the nested folders.
+- The active root package reported version 1.2.0 while /health reported 1.2.1.
+- Railway used MAX_CONCURRENT_JOBS, while the active code read MAX_ACTIVE_JOBS. The old variable was silently ignored and the default value 2 was used.
+- TRANSCODER_PUBLIC_URL is not read by worker code. It is required only on the main website service.
+
+This clean repository keeps one worker at the root and supports both MAX_ACTIVE_JOBS and the legacy MAX_CONCURRENT_JOBS variable.
