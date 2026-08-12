@@ -16,6 +16,10 @@ const MAX_ACTIVE_JOBS = clampInt(process.env.MAX_ACTIVE_JOBS ?? process.env.MAX_
 const JOB_TTL_MS = clampInt(process.env.JOB_TTL_SECONDS, 300, 86_400, 7200) * 1000;
 const STARTUP_READY_TIMEOUT_MS = clampInt(process.env.STARTUP_READY_TIMEOUT_SECONDS, 10, 90, 28) * 1000;
 const SEGMENT_SECONDS = clampInt(process.env.SEGMENT_SECONDS, 2, 10, 4);
+const FAST_SEGMENT_SECONDS = clampInt(process.env.FAST_SEGMENT_SECONDS, 2, 6, 3);
+const AUDIO_SWITCH_READY_TIMEOUT_MS = clampInt(process.env.AUDIO_SWITCH_READY_TIMEOUT_SECONDS, 20, 120, 60) * 1000;
+const FAST_AUDIO_SWITCH_MIN_SEGMENTS = clampInt(process.env.FAST_AUDIO_SWITCH_MIN_SEGMENTS, 2, 5, 2);
+const FULL_AUDIO_SWITCH_MIN_SEGMENTS = clampInt(process.env.FULL_AUDIO_SWITCH_MIN_SEGMENTS, 2, 6, 3);
 const MAX_OUTPUT_WIDTH = clampInt(process.env.MAX_OUTPUT_WIDTH, 640, 3840, 1920);
 const VIDEO_CRF = clampInt(process.env.VIDEO_CRF, 16, 32, 22);
 const FFMPEG_PRESET = /^[a-z0-9-]+$/i.test(String(process.env.FFMPEG_PRESET || ''))
@@ -335,9 +339,25 @@ function selectMode(probe) {
   return 'full-transcode';
 }
 
-function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode }) {
+function readinessPolicyForMode(mode) {
+  const fastPath = mode === 'remux' || mode === 'audio-transcode';
+  return fastPath
+    ? {
+        segmentSeconds: FAST_SEGMENT_SECONDS,
+        minimumAudioSwitchSegments: FAST_AUDIO_SWITCH_MIN_SEGMENTS,
+        hlsFlags: 'split_by_time+temp_file'
+      }
+    : {
+        segmentSeconds: SEGMENT_SECONDS,
+        minimumAudioSwitchSegments: FULL_AUDIO_SWITCH_MIN_SEGMENTS,
+        hlsFlags: 'independent_segments+temp_file'
+      };
+}
+
+function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode, readinessPolicy }) {
   const playlistPath = path.join(outputDir, 'master.m3u8');
   const segmentPath = path.join(outputDir, 'segment-%06d.ts');
+  const policy = readinessPolicy || readinessPolicyForMode(mode);
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
@@ -354,7 +374,11 @@ function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode }) {
   args.push('-i', sourceUrl, '-map', '0:v:0', '-map', audioMap, '-sn', '-dn');
 
   if (mode === 'remux' || mode === 'audio-transcode') {
-    args.push('-c:v', 'copy');
+    // Stream-copy mode must be allowed to cut HLS segments by time rather than
+    // waiting for distant source keyframes. Otherwise the first segment can
+    // play and the next segment may arrive far too late, which looks like a
+    // short trailer that suddenly stops after an audio-track switch.
+    args.push('-c:v', 'copy', '-muxdelay', '0', '-muxpreload', '0');
   } else {
     args.push(
       '-c:v', 'libx264',
@@ -363,7 +387,7 @@ function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode }) {
       '-pix_fmt', 'yuv420p',
       '-profile:v', 'high',
       '-vf', `scale=w='min(iw,${MAX_OUTPUT_WIDTH})':h=-2`,
-      '-force_key_frames', `expr:gte(t,n_forced*${SEGMENT_SECONDS})`,
+      '-force_key_frames', `expr:gte(t,n_forced*${policy.segmentSeconds})`,
       '-sc_threshold', '0'
     );
   }
@@ -377,10 +401,10 @@ function ffmpegArgs({ sourceUrl, outputDir, startSeconds, probe, mode }) {
     '-max_muxing_queue_size', '4096',
     '-avoid_negative_ts', 'make_zero',
     '-f', 'hls',
-    '-hls_time', String(SEGMENT_SECONDS),
+    '-hls_time', String(policy.segmentSeconds),
     '-hls_list_size', '0',
     '-hls_playlist_type', 'event',
-    '-hls_flags', 'independent_segments+temp_file',
+    '-hls_flags', policy.hlsFlags,
     '-hls_segment_filename', segmentPath,
     playlistPath
   );
@@ -397,13 +421,39 @@ function activeJobCount() {
   )).length;
 }
 
+function readPlaylistReadiness(job) {
+  let playlist = '';
+  try { playlist = fs.readFileSync(job.playlistPath, 'utf8'); } catch {}
+
+  const durations = [...playlist.matchAll(/^#EXTINF:([0-9.]+)/gm)]
+    .map(match => Number(match[1]))
+    .filter(value => Number.isFinite(value) && value > 0);
+  const segmentCount = durations.length;
+  const readyDurationSeconds = durations.reduce((sum, value) => sum + value, 0);
+  return {
+    hasPlaylist: playlist.includes('#EXTM3U'),
+    segmentCount,
+    readyDurationSeconds,
+    completed: playlist.includes('#EXT-X-ENDLIST') || job.state === 'completed'
+  };
+}
+
 function jobPublicPayload(job) {
+  const readiness = readPlaylistReadiness(job);
   return {
     jobId: job.id,
     playlistPath: `/hls/${job.id}/master.m3u8`,
     mode: job.mode,
     state: job.state,
+    startSeconds: Number(job.startSeconds) || 0,
+    stream: {
+      segmentSeconds: Number(job.readinessPolicy?.segmentSeconds) || SEGMENT_SECONDS,
+      readySegmentCount: readiness.segmentCount,
+      readyDurationSeconds: readiness.readyDurationSeconds,
+      completed: readiness.completed
+    },
     source: {
+      durationSeconds: Number(job.probe.duration) || null,
       format: job.probe.formatName || null,
       videoCodec: job.probe.video?.codec_name || null,
       audioCodec: job.probe.audio?.codec_name || null,
@@ -431,22 +481,32 @@ function removeJob(job, { deleteFiles = true } = {}) {
   if (deleteFiles) fs.rm(job.outputDir, { recursive: true, force: true }, () => {});
 }
 
-function waitForPlaylist(job) {
+function waitForPlaylist(job, { readinessMode = 'normal' } = {}) {
   return new Promise((resolve, reject) => {
-    const deadline = Date.now() + STARTUP_READY_TIMEOUT_MS;
+    const audioSwitch = readinessMode === 'audio-switch';
+    const policy = job.readinessPolicy || readinessPolicyForMode(job.mode);
+    const deadline = Date.now() + (audioSwitch ? AUDIO_SWITCH_READY_TIMEOUT_MS : STARTUP_READY_TIMEOUT_MS);
+
     const poll = () => {
-      if (!jobs.has(job.id)) return reject(Object.assign(new Error('The compatibility job was cancelled.'), { statusCode: 410 }));
+      if (!jobs.has(job.id)) {
+        return reject(Object.assign(new Error('The compatibility job was cancelled.'), { statusCode: 410 }));
+      }
 
       try {
-        const playlist = fs.readFileSync(job.playlistPath, 'utf8');
-        const segmentExists = fs.readdirSync(job.outputDir).some(name => /^segment-\d+\.ts$/.test(name));
-        if (playlist.includes('#EXTINF:') && segmentExists) {
-          job.state = 'running';
+        const readiness = readPlaylistReadiness(job);
+        const normalReady = readiness.hasPlaylist && readiness.segmentCount >= 1;
+        const audioSwitchReady = readiness.hasPlaylist
+          && readiness.segmentCount >= policy.minimumAudioSwitchSegments
+          && readiness.readyDurationSeconds >= policy.segmentSeconds * policy.minimumAudioSwitchSegments;
+        const completedShortStream = readiness.completed && readiness.segmentCount > 0;
+
+        if ((audioSwitch ? audioSwitchReady : normalReady) || completedShortStream) {
+          job.state = readiness.completed ? 'completed' : 'running';
           job.readyAt = Date.now();
           return resolve(jobPublicPayload(job));
         }
       } catch {
-        // FFmpeg has not produced the first complete segment yet.
+        // FFmpeg has not produced the required playback buffer yet.
       }
 
       if (job.state === 'failed') {
@@ -458,9 +518,13 @@ function waitForPlaylist(job) {
 
       if (Date.now() >= deadline) {
         removeJob(job);
-        return reject(Object.assign(new Error('The compatibility stream did not become ready in time.'), {
+        return reject(Object.assign(new Error(
+          audioSwitch
+            ? 'The selected audio track could not build a stable playback buffer in time.'
+            : 'The compatibility stream did not become ready in time.'
+        ), {
           statusCode: 504,
-          code: 'TRANSCODER_START_TIMEOUT'
+          code: audioSwitch ? 'AUDIO_SWITCH_BUFFER_TIMEOUT' : 'TRANSCODER_START_TIMEOUT'
         }));
       }
 
@@ -470,10 +534,11 @@ function waitForPlaylist(job) {
   });
 }
 
-async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
+async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null, readinessMode = 'normal' }) {
   const validatedUrl = await validateSourceUrl(sourceUrl);
   const safeStartSeconds = Math.min(86_400, Math.max(0, Number(startSeconds) || 0));
   const requestedAudioStreamIndex = optionalNonNegativeInteger(audioStreamIndex);
+  const safeReadinessMode = readinessMode === 'audio-switch' ? 'audio-switch' : 'normal';
   const sourceKey = crypto.createHash('sha256')
     .update(`${validatedUrl}|${safeStartSeconds}|${requestedAudioStreamIndex ?? 'auto'}`)
     .digest('hex');
@@ -481,8 +546,8 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
   const existing = existingId ? jobs.get(existingId) : null;
   if (existing && ['starting', 'running', 'completed'].includes(existing.state)) {
     existing.lastAccessAt = Date.now();
-    if (fs.existsSync(existing.playlistPath)) return jobPublicPayload(existing);
-    return waitForPlaylist(existing);
+    if (safeReadinessMode === 'normal' && fs.existsSync(existing.playlistPath)) return jobPublicPayload(existing);
+    return waitForPlaylist(existing, { readinessMode: safeReadinessMode });
   }
 
   if (activeJobCount() >= MAX_ACTIVE_JOBS) {
@@ -496,6 +561,7 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
   const baseProbe = await probeSource(validatedUrl);
   const probe = selectProbeAudioTrack(baseProbe, requestedAudioStreamIndex);
   const mode = selectMode(probe);
+  const readinessPolicy = readinessPolicyForMode(mode);
   const id = crypto.randomBytes(18).toString('base64url');
   const outputDir = path.join(WORK_ROOT, id);
   fs.mkdirSync(outputDir, { recursive: true });
@@ -512,6 +578,8 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
     readyAt: null,
     state: 'starting',
     mode,
+    readinessPolicy,
+    startSeconds: safeStartSeconds,
     probe,
     process: null,
     error: null,
@@ -526,7 +594,8 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
     outputDir,
     startSeconds: safeStartSeconds,
     probe,
-    mode
+    mode,
+    readinessPolicy
   }), { stdio: ['ignore', 'ignore', 'pipe'] });
 
   job.process = child;
@@ -549,7 +618,7 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null }) {
   });
 
   console.log(`[transcoder] ${id} ${mode} ${job.sourceLogUrl}`);
-  return waitForPlaylist(job);
+  return waitForPlaylist(job, { readinessMode: safeReadinessMode });
 }
 
 function contentType(filename) {
