@@ -33,6 +33,31 @@ const probeCache = new Map();
 const jobBySourceKey = new Map();
 fs.mkdirSync(WORK_ROOT, { recursive: true });
 
+// --- TEMPORARY DIAGNOSTICS (audio-switch freeze investigation, 2026-08-17) ---
+// Ring buffer of job lifecycle + HLS request events, readable via /health?diag=1.
+// Job ids are truncated and URLs stripped so nothing here grants stream access.
+// Remove this block once the audio-switch freeze root cause is confirmed.
+const DIAG_EVENTS = [];
+function diagSanitise(value) {
+  return String(value ?? '').replace(/https?:\/\/\S+/g, '[url]').slice(0, 300);
+}
+function diagShortId(id) {
+  return String(id || '').slice(0, 6);
+}
+function diag(jobOrId, event, detail = {}) {
+  const entry = {
+    t: new Date().toISOString(),
+    job: diagShortId(typeof jobOrId === 'string' ? jobOrId : jobOrId?.id),
+    event,
+    ...detail
+  };
+  DIAG_EVENTS.push(entry);
+  if (DIAG_EVENTS.length > 400) DIAG_EVENTS.splice(0, DIAG_EVENTS.length - 400);
+  // hls-served is high-frequency; keep it in the ring buffer but out of stdout.
+  if (event !== 'hls-served') console.log('[diag]', JSON.stringify(entry));
+}
+// ------------------------------------------------------------------------------
+
 function clampInt(value, min, max, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
@@ -438,6 +463,20 @@ function readPlaylistReadiness(job) {
   };
 }
 
+// TEMPORARY DIAGNOSTICS helper: compact readiness snapshot for diag events.
+function snapshotReadiness(job) {
+  try {
+    const readiness = readPlaylistReadiness(job);
+    return {
+      segs: readiness.segmentCount,
+      readySecs: Math.round(readiness.readyDurationSeconds * 10) / 10,
+      done: readiness.completed
+    };
+  } catch {
+    return { segs: -1, readySecs: -1, done: false };
+  }
+}
+
 function jobPublicPayload(job) {
   const readiness = readPlaylistReadiness(job);
   return {
@@ -468,8 +507,14 @@ function jobPublicPayload(job) {
   };
 }
 
-function removeJob(job, { deleteFiles = true } = {}) {
+function removeJob(job, { deleteFiles = true, reason = 'unspecified' } = {}) {
   if (!job) return;
+  diag(job, 'job-removed', {
+    reason,
+    state: job.state,
+    ffmpegAlive: Boolean(job.process && job.process.exitCode === null && !job.process.killed),
+    ...snapshotReadiness(job)
+  });
   if (job.process && !job.process.killed) {
     job.process.kill('SIGTERM');
     setTimeout(() => {
@@ -503,6 +548,13 @@ function waitForPlaylist(job, { readinessMode = 'normal' } = {}) {
         if ((audioSwitch ? audioSwitchReady : normalReady) || completedShortStream) {
           job.state = readiness.completed ? 'completed' : 'running';
           job.readyAt = Date.now();
+          diag(job, 'job-ready', {
+            readinessMode,
+            waitMs: Date.now() - job.createdAt,
+            segs: readiness.segmentCount,
+            readySecs: Math.round(readiness.readyDurationSeconds * 10) / 10,
+            done: readiness.completed
+          });
           return resolve(jobPublicPayload(job));
         }
       } catch {
@@ -510,6 +562,7 @@ function waitForPlaylist(job, { readinessMode = 'normal' } = {}) {
       }
 
       if (job.state === 'failed') {
+        diag(job, 'job-failed-during-wait', { readinessMode, error: diagSanitise(job.error) });
         return reject(Object.assign(new Error(job.error || 'The compatibility stream could not start.'), {
           statusCode: 502,
           code: 'TRANSCODER_FFMPEG_FAILED'
@@ -517,7 +570,13 @@ function waitForPlaylist(job, { readinessMode = 'normal' } = {}) {
       }
 
       if (Date.now() >= deadline) {
-        removeJob(job);
+        diag(job, 'job-ready-timeout', {
+          readinessMode,
+          ffmpegAlive: Boolean(job.process && job.process.exitCode === null && !job.process.killed),
+          ...snapshotReadiness(job),
+          logTail: diagSanitise(job.logTail.slice(-600))
+        });
+        removeJob(job, { reason: 'ready-timeout' });
         return reject(Object.assign(new Error(
           audioSwitch
             ? 'The selected audio track could not build a stable playback buffer in time.'
@@ -546,11 +605,17 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null, rea
   const existing = existingId ? jobs.get(existingId) : null;
   if (existing && ['starting', 'running', 'completed'].includes(existing.state)) {
     existing.lastAccessAt = Date.now();
+    diag(existing, 'job-reused', { readinessMode: safeReadinessMode, state: existing.state, ...snapshotReadiness(existing) });
     if (safeReadinessMode === 'normal' && fs.existsSync(existing.playlistPath)) return jobPublicPayload(existing);
     return waitForPlaylist(existing, { readinessMode: safeReadinessMode });
   }
 
   if (activeJobCount() >= MAX_ACTIVE_JOBS) {
+    diag('', 'job-rejected-busy', {
+      readinessMode: safeReadinessMode,
+      activeJobs: activeJobCount(),
+      maxActiveJobs: MAX_ACTIVE_JOBS
+    });
     throw Object.assign(new Error('The compatibility server is busy. Try another source shortly.'), {
       statusCode: 503,
       code: 'TRANSCODER_BUSY',
@@ -605,6 +670,7 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null, rea
   child.once('error', error => {
     job.state = 'failed';
     job.error = error.message;
+    diag(job, 'ffmpeg-spawn-error', { error: diagSanitise(error.message) });
   });
   child.once('close', code => {
     job.process = null;
@@ -615,8 +681,22 @@ async function createJob({ sourceUrl, startSeconds, audioStreamIndex = null, rea
       job.state = 'failed';
       job.error = `FFmpeg exited with code ${code}. ${job.logTail.slice(-1200)}`;
     }
+    diag(job, 'ffmpeg-exit', {
+      code,
+      state: job.state,
+      upMs: Date.now() - job.createdAt,
+      ...snapshotReadiness(job),
+      logTail: job.state === 'failed' ? diagSanitise(job.logTail.slice(-600)) : undefined
+    });
   });
 
+  diag(job, 'job-created', {
+    mode,
+    readinessMode: safeReadinessMode,
+    startSeconds: safeStartSeconds,
+    audioIndex: requestedAudioStreamIndex,
+    activeJobs: activeJobCount()
+  });
   console.log(`[transcoder] ${id} ${mode} ${job.sourceLogUrl}`);
   return waitForPlaylist(job, { readinessMode: safeReadinessMode });
 }
@@ -633,6 +713,7 @@ function serveHls(pathname, req, res) {
 
   const job = jobs.get(match[1]);
   if (!job) {
+    diag(match[1], 'hls-404-no-job', { file: match[2] });
     sendJson(res, 404, { error: 'This playback session has expired.' });
     return true;
   }
@@ -640,11 +721,13 @@ function serveHls(pathname, req, res) {
   const filename = match[2];
   const filePath = path.join(job.outputDir, filename);
   if (!filePath.startsWith(job.outputDir) || !fs.existsSync(filePath)) {
+    diag(job, 'hls-404-not-ready', { file: filename, state: job.state, ...snapshotReadiness(job) });
     sendJson(res, 404, { error: 'The requested HLS file is not ready.' });
     return true;
   }
 
   job.lastAccessAt = Date.now();
+  diag(job, 'hls-served', { file: filename, state: job.state, ...snapshotReadiness(job) });
   const stat = fs.statSync(filePath);
   res.writeHead(200, {
     'Content-Type': contentType(filename),
@@ -680,11 +763,27 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         status: 'ok',
         service: 'sny-stream-transcoder',
-        version: '1.2.1',
+        version: '1.2.1-diag1',
         ffmpeg: true,
         audioGuard: 'manual-on-demand-selector',
         activeJobs: activeJobCount(),
-        maxActiveJobs: MAX_ACTIVE_JOBS
+        maxActiveJobs: MAX_ACTIVE_JOBS,
+        // TEMPORARY DIAGNOSTICS: append ?diag=1 to include recent job/HLS events.
+        ...(url.searchParams.get('diag') === '1'
+          ? {
+              diagJobs: [...jobs.values()].map(job => ({
+                job: diagShortId(job.id),
+                state: job.state,
+                mode: job.mode,
+                ffmpegAlive: Boolean(job.process && job.process.exitCode === null && !job.process.killed),
+                ageSecs: Math.round((Date.now() - job.createdAt) / 1000),
+                lastAccessSecsAgo: Math.round((Date.now() - job.lastAccessAt) / 1000),
+                error: diagSanitise(job.error) || null,
+                ...snapshotReadiness(job)
+              })),
+              diagEvents: DIAG_EVENTS.slice(-200)
+            }
+          : {})
       });
     }
 
@@ -709,7 +808,7 @@ const server = http.createServer(async (req, res) => {
     if (jobMatch && req.method === 'DELETE') {
       const job = jobs.get(jobMatch[1]);
       if (!job) return sendJson(res, 200, { stopped: false });
-      removeJob(job);
+      removeJob(job, { reason: 'delete-request' });
       return sendJson(res, 200, { stopped: true });
     }
 
@@ -738,7 +837,7 @@ const server = http.createServer(async (req, res) => {
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const job of jobs.values()) {
-    if (now - job.lastAccessAt > JOB_TTL_MS) removeJob(job);
+    if (now - job.lastAccessAt > JOB_TTL_MS) removeJob(job, { reason: 'ttl-expired' });
   }
   for (const [key, cached] of probeCache.entries()) {
     if (!cached || cached.expiresAt <= now) probeCache.delete(key);
@@ -758,7 +857,7 @@ server.listen(PORT, HOST, () => {
 function shutdown(signal) {
   console.log(`${signal} received. Stopping transcoder jobs...`);
   clearInterval(cleanupTimer);
-  for (const job of jobs.values()) removeJob(job);
+  for (const job of jobs.values()) removeJob(job, { reason: `shutdown-${signal}` });
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref?.();
 }
